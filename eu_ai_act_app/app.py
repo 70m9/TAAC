@@ -8,6 +8,14 @@ from langchain_huggingface import HuggingFaceEmbeddings # type: ignore
 import shutil
 import os
 
+persist_directory = Constants.PERSIST_DIRECTORY
+
+os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+os.environ['LANGCHAIN_API_KEY'] = Constants.LANGCHAIN_API_KEY
+    
+HFHUB_API_KEY = Constants.HFHUB_API_KEY
+
 from langchain import hub # type: ignore
 from langchain_community.vectorstores import Chroma # type: ignore
 from langchain_core.output_parsers import StrOutputParser # type: ignore
@@ -16,12 +24,19 @@ from langchain_community.embeddings import HuggingFaceEmbeddings # type: ignore
 from langchain_community.llms import HuggingFaceHub # type: ignore
 from langchain_chroma import Chroma # type: ignore
 
-persist_directory = Constants.PERSIST_DIRECTORY
-os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-os.environ['LANGCHAIN_API_KEY'] = Constants.LANGCHAIN_API_KEY
-    
-HFHUB_API_KEY = Constants.HFHUB_API_KEY
+from langchain.chains import create_retrieval_chain # type: ignore
+from langchain_core.prompts import ChatPromptTemplate,PromptTemplate # type: ignore
+from langchain.output_parsers import CommaSeparatedListOutputParser # type: ignore
+import re
+from langchain.prompts import ChatPromptTemplate # type: ignore
+
+from langchain.chains.combine_documents import create_stuff_documents_chain # type: ignore
+
+from langchain.load import dumps, loads # type: ignore
+from langchain_core.prompts import ChatPromptTemplate # type: ignore
+from operator import itemgetter
+import textwrap
+
 
 
 @cl.step(type="createDatabase")
@@ -91,6 +106,71 @@ async def directoryCreate():
     ).send()
     return
 
+### Part 5.2 : Reciprocal Rank Fusion
+def reciprocal_rank_fusion(results: list[list], k=60):
+    """ Reciprocal_rank_fusion that takes multiple lists of ranked documents 
+        and an optional parameter k used in the RRF formula """
+    
+    # Initialize a dictionary to hold fused scores for each unique document
+    fused_scores = {}
+
+    # Iterate through each list of ranked documents
+    for docs in results:
+        # Iterate through each document in the list, with its rank (position in the list)
+        for rank, doc in enumerate(docs):
+            # Convert the document to a string format to use as a key (assumes documents can be serialized to JSON)
+            doc_str = dumps(doc)
+            # If the document is not yet in the fused_scores dictionary, add it with an initial score of 0
+            if doc_str not in fused_scores:
+                fused_scores[doc_str] = 0
+            # Retrieve the current score of the document, if any
+            previous_score = fused_scores[doc_str]
+            # Update the score of the document using the RRF formula: 1 / (rank + k)
+            fused_scores[doc_str] += 1 / (rank + k)
+
+    # Sort the documents based on their fused scores in descending order to get the final reranked results
+    reranked_results = [
+        (loads(doc), score)
+        for doc, score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+    # Return the reranked results as a list of tuples, each containing the document and its fused score
+    return reranked_results
+
+@cl.step(type="question_context")
+async def question_context(result):
+    pages_used(result)
+    return
+    
+@cl.step(type="pages_used")
+async def pages_used(result):
+    context_documents = result["context"]
+    # Create a list to store (page_number, page_content) tuples
+    pages = []
+
+        
+    # Extract page number and content from each document
+    for doc_tuple in context_documents:
+        document, score = doc_tuple  # Unpacking the tuple
+        page_number = document.metadata.get('page')
+        source = document.metadata.get('source')
+        page_content = document.page_content.strip()  # Clean up any whitespace
+        
+        # Append to the list as a tuple (page_number, page_content)
+        pages.append((page_number, page_content))
+
+    # Sort the pages by page number
+    pages.sort(key=lambda x: x[0])  # Sort based on the first element of the tuple, which is the page number    
+    
+    for page_number, page_content in pages:
+        message = f"Page {page_number}:"+"\n"
+        message = message + page_content+"\n"
+        message = message + "\n" + "-"*80 +"\n"
+        
+    await cl.Message(
+        content="Pages used for Context: \n " + message,
+    ).send()
+    return
 
 @cl.on_chat_start
 async def main():
@@ -111,11 +191,17 @@ async def main():
         ).send()
     else:
         await cl.Message(
-            content=f"Operation cancelled. Exiting.",
+            content=f"Operation denied.",
         ).send()
         #exit()
         
-    # Generate Retreiver
+        
+    # Post-processing
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+    
+    
+    ## Part 3 : Generate Retreiver
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={'tokenizer_kwargs': {'clean_up_tokenization_spaces': True}} # clean up extra spaces around special tokens
@@ -124,39 +210,94 @@ async def main():
     retriever = vectorstore.as_retriever()
     
     ## Part 4 : Initialize the LLM and prompt template
-    # Prompt
-    prompt = hub.pull("rlm/rag-prompt")
-
     # LLM
     # Corrected HuggingFaceEndpoint initialization
-    llm = HuggingFaceHub(repo_id="google/flan-t5-large", 
-                        model_kwargs={"temperature": 0.5, "max_length": 512},
+    llm = HuggingFaceHub(repo_id="meta-llama/Llama-3.2-3B-Instruct", 
+                        model_kwargs={"temperature": 0.4, "max_length": 200},
                         huggingfacehub_api_token=HFHUB_API_KEY)
     
-    ## Part 5 : Define RAG Chain
-    # Post-processing
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+    ## Part 5 :  RAG-Fusion
+    ### Part 5.1 : Generate variations of the user question
+    # RAG-Fusion: Related
+    template = """You are a helpful assistant that generates multiple search queries based on a single input query. \n
+    Generate multiple search queries related to: {question} \n
+    Output (4 queries):"""
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    generate_queries = (
+        prompt
+        | llm 
+        | StrOutputParser() 
+        |(lambda x: re.findall(r'\d+\.\s*(.+?)(?=\s*\d+\.|$)', x, re.MULTILINE)[-4:]) 
+    )
+    
+    ### Part 5.2 : Reciprocal Rank Fusion
+    retrieval_chain_rag_fusion = generate_queries | retriever.map() | reciprocal_rank_fusion
+    
+    ### Part 5.2 : Invoke RAG-Fusion Chain
+    # Improved template for question answering
+    template = """You are a knowledgeable assistant tasked with answering questions based on provided context. 
+    Please carefully read the context and provide a clear and accessible response that directly addresses the question. 
 
-    # Chain
-    rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    **Context**:
+    {context}
+
+    **Question**: 
+    {question}
+
+    **Guidelines**:
+    - Respond in a formal but accessible tone.
+    - Summarize the purpose clearly and concisely, emphasizing the main goals without overly complex phrasing.
+    - Avoid redundant details and focus on the essential points only.
+    - Use at max 3 sentences.
+
+
+    Provide your answer:
+    """
+    # Create the ChatPromptTemplate from the improved template
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    # LLM
+    # Corrected HuggingFaceEndpoint initialization
+    llm2 = HuggingFaceHub(repo_id="meta-llama/Llama-3.2-3B-Instruct", 
+                        model_kwargs={"temperature": 0.1, "max_length": 510},
+                        huggingfacehub_api_token=HFHUB_API_KEY)
+    
+    # Prepare the final RAG chain with structured components
+    final_rag_chain = (
+        {"context": retrieval_chain_rag_fusion, 
+        "question": itemgetter("question")} 
         | prompt
-        | llm
+        | llm2
         | StrOutputParser()
     )
-    cl.user_session.set("rag_chain", rag_chain)
+
+    chain = RunnablePassthrough.assign(context=retrieval_chain_rag_fusion).assign(
+        answer=final_rag_chain
+    )
+
+    keyword = "Provide your answer:"
+    
+    cl.user_session.set("chain", chain)
+    cl.user_session.set("keyword", keyword)
+    
     
         
-
-
 @cl.on_message
 async def main(message: cl.Message):
-    rag_chain = cl.user_session.get("rag_chain")
+    chain = cl.user_session.get("chain")
+    keyword = cl.user_session.get("keyword")
+
+    result = chain.invoke({"question": message.content})
     
-    result = rag_chain.invoke(message.content)
+    cl.user_session.set("result", result)
+    
     
     # Send a response back to the user
     await cl.Message(
-        content=f"{result}",
+        content= "Generated Answer: \n" + textwrap.fill(result["answer"].split(keyword)[-1].strip(),width=125),
     ).send()
+    
+    ### Pages used for Context
+    tool_res = await pages_used(result)
+
