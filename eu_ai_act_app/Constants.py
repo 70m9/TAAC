@@ -1,0 +1,3 @@
+LANGCHAIN_API_KEY = "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"
+HFHUB_API_KEY ="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"
+PERSIST_DIRECTORY = "../embeddings_db"
